@@ -10,6 +10,7 @@ namespace cv
 namespace dnn
 {
 
+// Quantize FP32/FP16 Inputs to INT8
 class QuantizeLayerImpl CV_FINAL : public QuantizeLayer
 {
 public:
@@ -51,9 +52,9 @@ public:
 
         if (inputs_.depth() == CV_16S)
         {
-            UMat inputFp32(shape(inputs[0]), CV_32F);
+            UMat inputFp32;
             convertFp16(inputs[0], inputFp32);
-            inputFp32.copyTo(inputs[0]);
+            inputs[0] = inputFp32;  // replace
         }
 
         inputs[0].convertTo(outputs[0], CV_8S, 1.f/scale, zeropoint);
@@ -77,6 +78,7 @@ public:
     }
 };
 
+// Dequantize INT8 Inputs to FP32/FP16
 class DequantizeLayerImpl CV_FINAL : public DequantizeLayer
 {
 public:
@@ -116,7 +118,7 @@ public:
         inputs_.getUMatVector(inputs);
         outputs_.getUMatVector(outputs);
 
-        UMat outputFp32(shape(outputs[0]), CV_32F);
+        UMat outputFp32;
         inputs[0].convertTo(outputFp32, CV_32F, scale, -(scale*zeropoint));
 
         if (outputs_.depth() == CV_16S)
@@ -143,6 +145,52 @@ public:
     }
 };
 
+// Rescale/Requantize INT8 Inputs from (scale1, zeropoint1) to (scale2, zeropoint2)
+class RequantizeLayerImpl CV_FINAL : public RequantizeLayer
+{
+public:
+    RequantizeLayerImpl(const LayerParams& params)
+    {
+        scale = params.get<float>("scale", 1.f);
+        shift = params.get<float>("shift", 0.f);
+        setParamsFrom(params);
+    }
+
+    virtual bool supportBackend(int backendId) CV_OVERRIDE
+    {
+        return backendId == DNN_BACKEND_OPENCV;
+    }
+
+    bool getMemoryShapes(const std::vector<MatShape> &inputs,
+                         const int requiredOutputs,
+                         std::vector<MatShape> &outputs,
+                         std::vector<MatShape> &internals) const CV_OVERRIDE
+    {
+        CV_Assert(inputs.size() == 1);
+        Layer::getMemoryShapes(inputs, requiredOutputs, outputs, internals);
+        return false;
+    }
+
+    virtual void finalize(InputArrayOfArrays inputs_arr, OutputArrayOfArrays outputs_arr) CV_OVERRIDE
+    {
+        std::vector<Mat> inputs, outputs;
+        inputs_arr.getMatVector(inputs);
+        outputs_arr.getMatVector(outputs);
+    }
+
+    void forward(InputArrayOfArrays inputs_arr, OutputArrayOfArrays outputs_arr, OutputArrayOfArrays internals_arr) CV_OVERRIDE
+    {
+        CV_TRACE_FUNCTION();
+        CV_TRACE_ARG_VALUE(name, "name", name.c_str());
+
+        std::vector<Mat> inputs, outputs;
+        inputs_arr.getMatVector(inputs);
+        outputs_arr.getMatVector(outputs);
+
+        inputs[0].convertTo(outputs[0], CV_8S, scale, shift);
+    }
+};
+
 Ptr<QuantizeLayer> QuantizeLayer::create(const LayerParams& params)
 {
     return Ptr<QuantizeLayer>(new QuantizeLayerImpl(params));
@@ -151,6 +199,11 @@ Ptr<QuantizeLayer> QuantizeLayer::create(const LayerParams& params)
 Ptr<DequantizeLayer> DequantizeLayer::create(const LayerParams& params)
 {
     return Ptr<DequantizeLayer>(new DequantizeLayerImpl(params));
+}
+
+Ptr<RequantizeLayer> RequantizeLayer::create(const LayerParams& params)
+{
+    return Ptr<RequantizeLayer>(new RequantizeLayerImpl(params));
 }
 
 }

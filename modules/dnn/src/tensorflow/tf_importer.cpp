@@ -124,8 +124,10 @@ void parseTensor(const tensorflow::TensorProto &tensor, Mat &dstBlob)
     }
 
     dstBlob.create(shape, CV_32F);
+    CV_Assert(dstBlob.isContinuous());
 
     Mat tensorContent = getTensorContent(tensor, /*no copy*/false);
+    CV_Assert(tensorContent.isContinuous());
     int size = tensorContent.total();
     CV_Assert(size == (int)dstBlob.total());
 
@@ -507,7 +509,7 @@ void ExcludeLayer(tensorflow::GraphDef& net, const int layer_index, const int in
         net.mutable_node()->DeleteSubrange(layer_index, 1);
 }
 
-class LayerHandler;
+class TFLayerHandler;
 
 class TFImporter
 {
@@ -516,8 +518,7 @@ public:
     TFImporter(Net& net, const char *dataModel, size_t lenModel,
                const char *dataConfig = NULL, size_t lenConfig = 0);
 protected:
-    std::unique_ptr<LayerHandler> layerHandler;
-    std::unique_ptr<Net> utilNet;
+    std::unique_ptr<TFLayerHandler> layerHandler;
     Net& dstNet;
     void populateNet();
 
@@ -556,10 +557,10 @@ protected:
     std::map<String, int> layer_id;
 
 private:
-    void addPermuteLayer(const int* order, const std::string& permName, Pin& inpId);
+    void addPermuteLayer(const int* order, const std::string& permName, Pin& inpId, int orderSize = 4);
     void setPadding(LayerParams &layerParams, const tensorflow::NodeDef &layer, std::string& inputName, float value = 0.);
 
-    friend class LayerHandler;
+    friend class TFLayerHandler;
     typedef void (TFImporter::*TFImporterNodeParser)(tensorflow::GraphDef&, const tensorflow::NodeDef&, LayerParams&);
     typedef std::map<std::string, TFImporterNodeParser> DispatchMap;
 
@@ -596,6 +597,7 @@ private:
     void parseClipByValue        (tensorflow::GraphDef& net, const tensorflow::NodeDef& layer, LayerParams& layerParams);
     void parseLeakyRelu          (tensorflow::GraphDef& net, const tensorflow::NodeDef& layer, LayerParams& layerParams);
     void parseActivation         (tensorflow::GraphDef& net, const tensorflow::NodeDef& layer, LayerParams& layerParams);
+    void parseExpandDims         (tensorflow::GraphDef& net, const tensorflow::NodeDef& layer, LayerParams& layerParams);
 
     void parseCustomLayer        (tensorflow::GraphDef& net, const tensorflow::NodeDef& layer, LayerParams& layerParams);
 };
@@ -625,18 +627,17 @@ void TFImporter::setPadding(LayerParams &layerParams, const tensorflow::NodeDef 
     layerParams.set("pad_mode", "VALID");
 }
 
-class LayerHandler
+class TFLayerHandler : public detail::LayerHandler
 {
 public:
-    LayerHandler(TFImporter* importer_);
-    ~LayerHandler() = default;
+    explicit TFLayerHandler(TFImporter* importer_);
 
-    bool handleMissing(const opencv_tensorflow::NodeDef& layer);
-    void handleFailed(const opencv_tensorflow::NodeDef& layer);
+    void fillRegistry(const tensorflow::GraphDef& net);
+    bool handleMissing(const tensorflow::NodeDef& layer);
+    void handleFailed(const tensorflow::NodeDef& layer);
 
-private:
+protected:
     TFImporter* importer;
-    std::set<std::string> layers;
 };
 
 const TFImporter::DispatchMap TFImporter::buildDispatchMap()
@@ -674,6 +675,7 @@ const TFImporter::DispatchMap TFImporter::buildDispatchMap()
     dispatch["LeakyRelu"] = &TFImporter::parseLeakyRelu;
     dispatch["Abs"] = dispatch["Tanh"] = dispatch["Sigmoid"] = dispatch["Relu"] =
             dispatch["Elu"] = dispatch["Exp"] = dispatch["Identity"] = dispatch["Relu6"] = &TFImporter::parseActivation;
+    dispatch["ExpandDims"] = &TFImporter::parseExpandDims;
 
     return dispatch;
 }
@@ -935,7 +937,12 @@ void TFImporter::parseBias(tensorflow::GraphDef& net, const tensorflow::NodeDef&
         layer_id[name] = id;
 
         // one input only
-        connect(layer_id, dstNet, parsePin(layer.input(0)), id, 0);
+        Pin inp0 = parsePin(layer.input(0));
+        if (layer_id.find(inp0.name) != layer_id.end())
+            // First operand is a constant.
+            connect(layer_id, dstNet, parsePin(layer.input(0)), id, 0);
+        else
+            connect(layer_id, dstNet, parsePin(layer.input(1)), id, 0);
     }
     else
     {
@@ -1106,6 +1113,123 @@ void TFImporter::parseReshape(tensorflow::GraphDef& net, const tensorflow::NodeD
         layer_id[name] = id;
         connect(layer_id, dstNet, inpId, id, 0);
         connect(layer_id, dstNet, parsePin(layer.input(1)), id, 1);
+        data_layouts[name] = inpLayout;
+    }
+}
+
+void TFImporter::parseExpandDims(tensorflow::GraphDef& net, const tensorflow::NodeDef& layer, LayerParams& layerParams)
+{
+    const std::string& name = layer.name();
+    const int num_inputs = layer.input_size();
+
+    CV_Assert(!netInputShapes.empty());
+
+    CV_CheckGT(num_inputs, 0, "");
+    Pin inpId = parsePin(layer.input(0));
+    DataLayout inpLayout = getDataLayout(layer.input(0), data_layouts);
+
+    // Get input shape
+    std::vector<MatShape> inShape_, outShape_;
+    int inpIdindex = layer_id.find(inpId.name)->second;
+
+    dstNet.getLayerShapes(netInputShapes, inpIdindex, inShape_, outShape_);
+    MatShape inpShape = outShape_[0];
+    std::vector<int> outShape = inpShape;
+
+    int outShapeSize = outShape.size();
+
+    CV_Assert(inpShape.size() >= 1);
+    // 2nd blob is dims tensor
+    int axis = getConstBlob(layer, value_id, 1).int_val().Get(0);
+
+    // Convert negative numbers to positive numbers, axis can be in range [-(D+1), D].
+    if(axis < 0)
+    {
+        axis = inpShape.size() + axis + 1;
+    }
+
+    CV_Assert(0 <= axis && axis <= inpShape.size());
+
+    // After ExpendDims, 3-dim data will become 4-dim data, and OpenCV retains 4-dim data as NCHW data layout.
+    // Convert OpenCV's NHC to NCH first.
+    if(outShapeSize == 3)
+    {
+        // If axis equal to outShapeSize, that mean we expand in Channel dimmension, and do not add permuteLayer.
+        if(axis != outShapeSize)
+        {
+            int order[] = {0, 2, 1};  // From OpenCV's NHC to NCH.
+            addPermuteLayer(order, name + "/nch", inpId, 3);
+
+            std::swap(outShape[1], outShape[2]);
+        }
+        axis = (axis != 0)?(axis % outShapeSize + 1):2;
+    }
+
+    if(inpShape.size() == 4)
+    {
+        if(axis == inpShape.size())
+        {
+            int order[] = {0, 2, 3, 1};  // From OpenCV's NCHW to NHWC.
+            addPermuteLayer(order, name + "/nhwc", inpId);
+
+            // Convert shape From OpenCV's NCHW to NHWC.
+            if(inpLayout == DATA_LAYOUT_NHWC)
+            {
+                std::swap(outShape[1], outShape[2]);
+                std::swap(outShape[2], outShape[3]);
+            }
+        }
+        if(inpLayout == DATA_LAYOUT_NHWC || inpLayout == DATA_LAYOUT_NCHW)
+        {
+            // toNCHW
+            axis = (axis != 0)?(axis % outShapeSize + 1):0;
+        }
+    }
+
+    // After ExpendDims, 5-dim data will become 6-dim data, and OpenCV retains 6-dim data as original data layout.
+    // Convert OpenCV's NCDHW to NDHWC first.
+    if (inpShape.size() == 5 && (inpLayout == DATA_LAYOUT_NDHWC || inpLayout == DATA_LAYOUT_UNKNOWN))
+    {
+        int order[] = {0, 2, 3, 4, 1};  // From OpenCV's NCDHW to NDHWC.
+        addPermuteLayer(order, name + "/ndhwc", inpId, 5);
+
+        // Convert shape From OpenCV's NCDHW to NDHWC.
+        if(inpLayout == DATA_LAYOUT_NDHWC)
+        {
+            std::swap(outShape[1], outShape[2]);
+            std::swap(outShape[2], outShape[3]);
+            std::swap(outShape[3], outShape[4]);
+        }
+    }
+
+    outShape.insert(outShape.begin() + axis, 1);
+    outShapeSize += 1;
+
+    // From OpenCV's NCDHW to NDHWC.
+    if((inpLayout != DATA_LAYOUT_NHWC && inpLayout != DATA_LAYOUT_NCHW) && outShapeSize == 5)
+    {
+        for(int i = 1; i < outShapeSize - 1; i++)
+        {
+            std::swap(outShape[outShapeSize - i - 1], outShape[outShapeSize - i]);
+        }
+    }
+
+    layerParams.set("dim", DictValue::arrayInt(&outShape[0], outShape.size()));
+    int id = dstNet.addLayer(name, "Reshape", layerParams);
+    layer_id[name] = id;
+
+    connect(layer_id, dstNet, inpId, id, 0);
+
+    if(outShapeSize == 5)
+    {
+        data_layouts[name] = DATA_LAYOUT_NDHWC;
+    }
+    else if(outShapeSize == 4)
+    {
+        data_layouts[name] = DATA_LAYOUT_NCHW;
+    }
+    else
+    {
         data_layouts[name] = inpLayout;
     }
 }
@@ -1413,6 +1537,15 @@ void TFImporter::parsePlaceholder(tensorflow::GraphDef& net, const tensorflow::N
         {
             std::swap(dims[1], dims[3]);  // NHWC->NCWH
             std::swap(dims[2], dims[3]);  // NCWH->NCHW
+            if (dims[0] == -1)  // It's OK to have undetermined batch size
+                dims[0] = 1;
+        }
+
+        if (dims.size() == 5 && predictedLayout == DATA_LAYOUT_NDHWC)
+        {
+            std::swap(dims[3], dims[4]);  // NDHWC->NDHCW
+            std::swap(dims[2], dims[3]);  // NDHCW->NDCHW
+            std::swap(dims[1], dims[2]);  // NDCHW->NCDHW
             if (dims[0] == -1)  // It's OK to have undetermined batch size
                 dims[0] = 1;
         }
@@ -2471,9 +2604,8 @@ void TFImporter::parseCustomLayer(tensorflow::GraphDef& net, const tensorflow::N
 }
 
 TFImporter::TFImporter(Net& net, const char *model, const char *config)
-    :  layerHandler(DNN_DIAGNOSTICS_RUN ?  new LayerHandler(this) : nullptr),
-        utilNet(DNN_DIAGNOSTICS_RUN ?  new Net : nullptr),
-        dstNet(DNN_DIAGNOSTICS_RUN ? *utilNet : net), dispatch(buildDispatchMap())
+    : layerHandler(DNN_DIAGNOSTICS_RUN ?  new TFLayerHandler(this) : nullptr),
+        dstNet(net), dispatch(buildDispatchMap())
 {
     if (model && model[0])
     {
@@ -2494,9 +2626,8 @@ TFImporter::TFImporter(
         const char *dataModel, size_t lenModel,
         const char *dataConfig, size_t lenConfig
 )
-    :  layerHandler(DNN_DIAGNOSTICS_RUN ?  new LayerHandler(this) : nullptr),
-       utilNet(DNN_DIAGNOSTICS_RUN ?  new Net : nullptr),
-       dstNet(DNN_DIAGNOSTICS_RUN ? *utilNet : net), dispatch(buildDispatchMap())
+    :  layerHandler(DNN_DIAGNOSTICS_RUN ?  new TFLayerHandler(this) : nullptr),
+       dstNet(net), dispatch(buildDispatchMap())
 {
     if (dataModel != NULL && lenModel > 0)
     {
@@ -2542,8 +2673,10 @@ void TFImporter::kernelFromTensor(const tensorflow::TensorProto &tensor, Mat &ds
     out_c = shape[0]; input_c = shape[1];
 
     dstBlob.create(shape, CV_32F);
+    CV_Assert(dstBlob.isContinuous());
 
     Mat tensorContent = getTensorContent(tensor, /*no copy*/false);
+    CV_Assert(tensorContent.isContinuous());
     int size = tensorContent.total();
     CV_Assert(size == (int)dstBlob.total());
 
@@ -2855,6 +2988,11 @@ void TFImporter::populateNet()
     addConstNodes(netBin, value_id, layers_to_ignore);
     addConstNodes(netTxt, value_id, layers_to_ignore);
 
+    if (DNN_DIAGNOSTICS_RUN) {
+        CV_LOG_INFO(NULL, "DNN/TF: start diagnostic run!");
+        layerHandler->fillRegistry(net);
+    }
+
     for (int li = 0; li < layersSize; li++)
     {
         const tensorflow::NodeDef& layer = net.node(li);
@@ -2873,13 +3011,13 @@ void TFImporter::populateNet()
         CV_Assert(!netInputsNames[i].empty());
     }
     dstNet.setInputsNames(netInputsNames);
-    CV_LOG_DEBUG(NULL, "DNN/TF: ===================== Import completed =====================");
+    CV_LOG_DEBUG(NULL, (DNN_DIAGNOSTICS_RUN? "DNN/TF: diagnostic run completed!" : "DNN/TF: import completed!"));
 }
 
-void TFImporter::addPermuteLayer(const int* order, const std::string& permName, Pin& inpId)
+void TFImporter::addPermuteLayer(const int* order, const std::string& permName, Pin& inpId, int orderSize)
 {
     LayerParams permLP;
-    permLP.set("order", DictValue::arrayInt<const int*>(order, 4));
+    permLP.set("order", DictValue::arrayInt<const int*>(order, orderSize));
     CV_Assert(layer_id.find(permName) == layer_id.end());
     int permId = dstNet.addLayer(permName, "Permute", permLP);
     layer_id[permName] = permId;
@@ -2933,41 +3071,45 @@ void TFImporter::parseNode(const tensorflow::NodeDef& layer)
     }
 }
 
-LayerHandler::LayerHandler(TFImporter* importer_) : importer(importer_) {}
+TFLayerHandler::TFLayerHandler(TFImporter* importer_) : importer(importer_) {}
 
-void LayerHandler::handleFailed(const opencv_tensorflow::NodeDef& layer)
+void TFLayerHandler::fillRegistry(const tensorflow::GraphDef& net)
 {
-    LayerParams lp;
-    lp.name = layer.name();
-    lp.type = "NotImplemented";
-    lp.set("type", layer.op());
+    for (int li = 0; li < net.node_size(); li++) {
+        const tensorflow::NodeDef& layer = net.node(li);
+
+        const std::string& name = layer.name();
+        const std::string& type = layer.op();
+        if (importer->dispatch.find(type) == importer->dispatch.end())
+        {
+            addMissing(name, type);
+        }
+    }
+    printMissing();
+};
+
+bool TFLayerHandler::handleMissing(const tensorflow::NodeDef& layer)
+{
+    bool unsupported = contains(layer.op());
+
+    if (unsupported)
+    {
+        handleFailed(layer);
+    }
+
+    return unsupported;
+}
+
+void TFLayerHandler::handleFailed(const tensorflow::NodeDef& layer)
+{
+    LayerParams lp = getNotImplementedParams(layer.name(), layer.op());
 
     // the layer will be created or its params and type will be replaced
-    int id = importer->dstNet.addLayer(lp.name, "NotImplemented", lp);
+    int id = importer->dstNet.addLayer(lp.name, lp.type, lp);
     if (id != -1) // internal layer failure before the call to addLayer()
     {
         importer->layer_id[lp.name] = id;
     }
-}
-
-bool LayerHandler::handleMissing(const opencv_tensorflow::NodeDef& layer)
-{
-    LayerParams lp;
-    // If we didn't add it, but can create it, it's custom and not missing.
-    if (layers.find(layer.op()) == layers.end() && LayerFactory::createLayerInstance(layer.op(), lp))
-    {
-        return false;
-    }
-
-    if (layers.insert(layer.op()).second)
-    {
-        CV_LOG_ERROR(NULL, "DNN/TF: Node='" << layer.name() << "' of type='"<< layer.op()
-                                            << "' is not supported. This error won't be displayed again.");
-    }
-
-    handleFailed(layer);
-
-    return true;
 }
 
 } // namespace
@@ -2976,17 +3118,13 @@ bool LayerHandler::handleMissing(const opencv_tensorflow::NodeDef& layer)
 
 Net readNetFromTensorflow(const String &model, const String &config)
 {
-    Net net;
-    TFImporter importer(net, model.c_str(), config.c_str());
-    return net;
+    return detail::readNetDiagnostic<TFImporter>(model.c_str(), config.c_str());
 }
 
 Net readNetFromTensorflow(const char* bufferModel, size_t lenModel,
                           const char* bufferConfig, size_t lenConfig)
 {
-    Net net;
-    TFImporter importer(net, bufferModel, lenModel, bufferConfig, lenConfig);
-    return net;
+    return detail::readNetDiagnostic<TFImporter>(bufferModel, lenModel, bufferConfig, lenConfig);
 }
 
 Net readNetFromTensorflow(const std::vector<uchar>& bufferModel, const std::vector<uchar>& bufferConfig)

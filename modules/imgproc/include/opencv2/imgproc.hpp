@@ -1259,12 +1259,17 @@ protected:
 //! @addtogroup imgproc_feature
 //! @{
 
+/** @example samples/cpp/lsd_lines.cpp
+An example using the LineSegmentDetector
+\image html building_lsd.png "Sample output image" width=434 height=300
+*/
+
 /** @brief Line segment detector class
 
 following the algorithm described at @cite Rafael12 .
 
-@note Implementation has been removed due original code license conflict
-
+@note Implementation has been removed from OpenCV version 3.4.6 to 3.4.15 and version 4.1.0 to 4.5.3 due original code license conflict.
+restored again after [Computation of a NFA](https://github.com/rafael-grompone-von-gioi/binomial_nfa) code published under the MIT license.
 */
 class CV_EXPORTS_W LineSegmentDetector : public Algorithm
 {
@@ -1278,8 +1283,8 @@ public:
 
     @param image A grayscale (CV_8UC1) input image. If only a roi needs to be selected, use:
     `lsd_ptr-\>detect(image(roi), lines, ...); lines += Scalar(roi.x, roi.y, roi.x, roi.y);`
-    @param lines A vector of Vec4i or Vec4f elements specifying the beginning and ending point of a line. Where
-    Vec4i/Vec4f is (x1, y1, x2, y2), point 1 is the start, point 2 - end. Returned lines are strictly
+    @param lines A vector of Vec4f elements specifying the beginning and ending point of a line. Where
+    Vec4f is (x1, y1, x2, y2), point 1 is the start, point 2 - end. Returned lines are strictly
     oriented depending on the gradient.
     @param width Vector of widths of the regions, where the lines are found. E.g. Width of line.
     @param prec Vector of precisions with which the lines are found.
@@ -1327,8 +1332,6 @@ to edit those, as to tailor it for their own application.
 @param log_eps Detection threshold: -log10(NFA) \> log_eps. Used only when advance refinement is chosen.
 @param density_th Minimal density of aligned region points in the enclosing rectangle.
 @param n_bins Number of bins in pseudo-ordering of gradient modulus.
-
-@note Implementation has been removed due original code license conflict
  */
 CV_EXPORTS_W Ptr<LineSegmentDetector> createLineSegmentDetector(
     int refine = LSD_REFINE_STD, double scale = 0.8,
@@ -2742,13 +2745,6 @@ CV_EXPORTS_W void warpPolar(InputArray src, OutputArray dst, Size dsize,
 //! @addtogroup imgproc_misc
 //! @{
 
-/** @overload */
-CV_EXPORTS_W void integral( InputArray src, OutputArray sum, int sdepth = -1 );
-
-/** @overload */
-CV_EXPORTS_AS(integral2) void integral( InputArray src, OutputArray sum,
-                                        OutputArray sqsum, int sdepth = -1, int sqdepth = -1 );
-
 /** @brief Calculates the integral of an image.
 
 The function calculates one or more integral images for the source image as follows:
@@ -2786,6 +2782,13 @@ CV_64F.
 CV_EXPORTS_AS(integral3) void integral( InputArray src, OutputArray sum,
                                         OutputArray sqsum, OutputArray tilted,
                                         int sdepth = -1, int sqdepth = -1 );
+
+/** @overload */
+CV_EXPORTS_W void integral( InputArray src, OutputArray sum, int sdepth = -1 );
+
+/** @overload */
+CV_EXPORTS_AS(integral2) void integral( InputArray src, OutputArray sum,
+                                        OutputArray sqsum, int sdepth = -1, int sqdepth = -1 );
 
 //! @} imgproc_misc
 
@@ -3469,19 +3472,6 @@ the first variant of the function and distanceType == #DIST_L1.
 CV_EXPORTS_W void distanceTransform( InputArray src, OutputArray dst,
                                      int distanceType, int maskSize, int dstType=CV_32F);
 
-/** @example samples/cpp/ffilldemo.cpp
-An example using the FloodFill technique
-*/
-
-/** @overload
-
-variant without `mask` parameter
-*/
-CV_EXPORTS int floodFill( InputOutputArray image,
-                          Point seedPoint, Scalar newVal, CV_OUT Rect* rect = 0,
-                          Scalar loDiff = Scalar(), Scalar upDiff = Scalar(),
-                          int flags = 4 );
-
 /** @brief Fills a connected component with the given color.
 
 The function cv::floodFill fills a connected component starting from the seed point with the specified
@@ -3557,6 +3547,19 @@ CV_EXPORTS_W int floodFill( InputOutputArray image, InputOutputArray mask,
                             Point seedPoint, Scalar newVal, CV_OUT Rect* rect=0,
                             Scalar loDiff = Scalar(), Scalar upDiff = Scalar(),
                             int flags = 4 );
+
+/** @example samples/cpp/ffilldemo.cpp
+An example using the FloodFill technique
+*/
+
+/** @overload
+
+variant without `mask` parameter
+*/
+CV_EXPORTS int floodFill( InputOutputArray image,
+                          Point seedPoint, Scalar newVal, CV_OUT Rect* rect = 0,
+                          Scalar loDiff = Scalar(), Scalar upDiff = Scalar(),
+                          int flags = 4 );
 
 //! Performs linear blending of two images:
 //! \f[ \texttt{dst}(i,j) = \texttt{weights1}(i,j)*\texttt{src1}(i,j) + \texttt{weights2}(i,j)*\texttt{src2}(i,j) \f]
@@ -4396,7 +4399,7 @@ lines are drawn using Gaussian filtering.
 CV_EXPORTS_W void line(InputOutputArray img, Point pt1, Point pt2, const Scalar& color,
                      int thickness = 1, int lineType = LINE_8, int shift = 0);
 
-/** @brief Draws a arrow segment pointing from the first point to the second one.
+/** @brief Draws an arrow segment pointing from the first point to the second one.
 
 The function cv::arrowedLine draws an arrow between pt1 and pt2 points in the image. See also #line.
 
@@ -4526,11 +4529,6 @@ CV_EXPORTS_W void drawMarker(InputOutputArray img, Point position, const Scalar&
 /* END OF MARKER SECTION */
 /* ----------------------------------------------------------------------------------------- */
 
-/** @overload */
-CV_EXPORTS void fillConvexPoly(InputOutputArray img, const Point* pts, int npts,
-                               const Scalar& color, int lineType = LINE_8,
-                               int shift = 0);
-
 /** @brief Fills a convex polygon.
 
 The function cv::fillConvexPoly draws a filled convex polygon. This function is much faster than the
@@ -4549,10 +4547,9 @@ CV_EXPORTS_W void fillConvexPoly(InputOutputArray img, InputArray points,
                                  int shift = 0);
 
 /** @overload */
-CV_EXPORTS void fillPoly(InputOutputArray img, const Point** pts,
-                         const int* npts, int ncontours,
-                         const Scalar& color, int lineType = LINE_8, int shift = 0,
-                         Point offset = Point() );
+CV_EXPORTS void fillConvexPoly(InputOutputArray img, const Point* pts, int npts,
+                               const Scalar& color, int lineType = LINE_8,
+                               int shift = 0);
 
 /** @example samples/cpp/tutorial_code/ImgProc/basic_drawing/Drawing_1.cpp
 An example using drawing functions
@@ -4577,9 +4574,10 @@ CV_EXPORTS_W void fillPoly(InputOutputArray img, InputArrayOfArrays pts,
                            Point offset = Point() );
 
 /** @overload */
-CV_EXPORTS void polylines(InputOutputArray img, const Point* const* pts, const int* npts,
-                          int ncontours, bool isClosed, const Scalar& color,
-                          int thickness = 1, int lineType = LINE_8, int shift = 0 );
+CV_EXPORTS void fillPoly(InputOutputArray img, const Point** pts,
+                         const int* npts, int ncontours,
+                         const Scalar& color, int lineType = LINE_8, int shift = 0,
+                         Point offset = Point() );
 
 /** @brief Draws several polygonal curves.
 
@@ -4597,6 +4595,11 @@ The function cv::polylines draws one or more polygonal curves.
 CV_EXPORTS_W void polylines(InputOutputArray img, InputArrayOfArrays pts,
                             bool isClosed, const Scalar& color,
                             int thickness = 1, int lineType = LINE_8, int shift = 0 );
+
+/** @overload */
+CV_EXPORTS void polylines(InputOutputArray img, const Point* const* pts, const int* npts,
+                          int ncontours, bool isClosed, const Scalar& color,
+                          int thickness = 1, int lineType = LINE_8, int shift = 0 );
 
 /** @example samples/cpp/contours2.cpp
 An example program illustrates the use of cv::findContours and cv::drawContours
@@ -4630,7 +4633,7 @@ parameter is only taken into account when there is hierarchy available.
 @param offset Optional contour shift parameter. Shift all the drawn contours by the specified
 \f$\texttt{offset}=(dx,dy)\f$ .
 @note When thickness=#FILLED, the function is designed to handle connected components with holes correctly
-even when no hierarchy date is provided. This is done by analyzing all the outlines together
+even when no hierarchy data is provided. This is done by analyzing all the outlines together
 using even-odd rule. This may give incorrect results if you have a joint collection of separately retrieved
 contours. In order to solve this problem, you need to call #drawContours separately for each sub-group
 of contours, or iterate over the collection using contourIdx parameter.
@@ -4644,7 +4647,7 @@ CV_EXPORTS_W void drawContours( InputOutputArray image, InputArrayOfArrays conto
 /** @brief Clips the line against the image rectangle.
 
 The function cv::clipLine calculates a part of the line segment that is entirely within the specified
-rectangle. it returns false if the line segment is completely outside the rectangle. Otherwise,
+rectangle. It returns false if the line segment is completely outside the rectangle. Otherwise,
 it returns true .
 @param imgSize Image size. The image rectangle is Rect(0, 0, imgSize.width, imgSize.height) .
 @param pt1 First line point.

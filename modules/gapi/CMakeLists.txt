@@ -164,8 +164,25 @@ set(gapi_srcs
     src/backends/python/gpythonbackend.cpp
 
     # Streaming source
-    src/streaming/onevpl/onevpl_source.cpp
-    src/streaming/onevpl/onevpl_source_priv.cpp
+    src/streaming/onevpl/source.cpp
+    src/streaming/onevpl/source_priv.cpp
+    src/streaming/onevpl/file_data_provider.cpp
+    src/streaming/onevpl/cfg_params.cpp
+    src/streaming/onevpl/cfg_params_parser.cpp
+    src/streaming/onevpl/utils.cpp
+    src/streaming/onevpl/data_provider_interface_exception.cpp
+    src/streaming/onevpl/accelerators/surface/cpu_frame_adapter.cpp
+    src/streaming/onevpl/accelerators/surface/surface.cpp
+    src/streaming/onevpl/accelerators/surface/surface_pool.cpp
+    src/streaming/onevpl/accelerators/accel_policy_cpu.cpp
+    src/streaming/onevpl/accelerators/accel_policy_dx11.cpp
+    src/streaming/onevpl/engine/engine_session.cpp
+    src/streaming/onevpl/engine/processing_engine_base.cpp
+    src/streaming/onevpl/engine/decode/decode_engine_legacy.cpp
+    src/streaming/onevpl/engine/decode/decode_session.cpp
+
+    src/streaming/onevpl/cfg_param_device_selector.cpp
+    src/streaming/onevpl/device_selector_interface.cpp
 
     # Utils (ITT tracing)
     src/utils/itt.cpp
@@ -242,6 +259,9 @@ if(HAVE_GAPI_ONEVPL)
   if(TARGET opencv_test_gapi)
     ocv_target_compile_definitions(opencv_test_gapi PRIVATE -DHAVE_ONEVPL)
     ocv_target_link_libraries(opencv_test_gapi PRIVATE ${VPL_IMPORTED_TARGETS})
+    if(HAVE_D3D11 AND HAVE_OPENCL)
+        ocv_target_include_directories(opencv_test_gapi SYSTEM PRIVATE ${OPENCL_INCLUDE_DIRS})
+    endif()
   endif()
   ocv_target_compile_definitions(${the_module} PRIVATE -DHAVE_ONEVPL)
   ocv_target_link_libraries(${the_module} PRIVATE ${VPL_IMPORTED_TARGETS})
@@ -266,3 +286,15 @@ endif()
 
 ocv_add_perf_tests()
 ocv_add_samples()
+
+
+# Required for sample with inference on host
+if (TARGET example_gapi_onevpl_infer_single_roi)
+  if(OPENCV_GAPI_INF_ENGINE)
+    ocv_target_link_libraries(example_gapi_onevpl_infer_single_roi PRIVATE ${INF_ENGINE_TARGET})
+    ocv_target_compile_definitions(example_gapi_onevpl_infer_single_roi PRIVATE -DHAVE_INF_ENGINE)
+  endif()
+  if(HAVE_D3D11 AND HAVE_OPENCL)
+    ocv_target_include_directories(example_gapi_onevpl_infer_single_roi SYSTEM PRIVATE ${OPENCL_INCLUDE_DIRS})
+  endif()
+endif()
