@@ -33,7 +33,7 @@ if(WITH_IPP)
         )
         AND NOT OPENCV_SKIP_IPP_EXCLUDE_LIBS
     )
-      set(CMAKE_SHARED_LINKER_FLAGS "-Wl,--exclude-libs,libippicv.a -Wl,--exclude-libs,libippiw.a ${CMAKE_SHARED_LINKER_FLAGS}")
+      set(CMAKE_SHARED_LINKER_FLAGS "-Wl,-Bsymbolic,--exclude-libs,libippicv.a -Wl,--exclude-libs,libippiw.a ${CMAKE_SHARED_LINKER_FLAGS}")
     endif()
   endif()
 endif()
