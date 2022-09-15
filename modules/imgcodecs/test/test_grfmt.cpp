@@ -211,7 +211,7 @@ TEST_P(Imgcodecs_ExtSize, write_imageseq)
 
 const string all_exts[] =
 {
-#ifdef HAVE_PNG
+#if defined(HAVE_PNG) || defined(HAVE_SPNG)
     ".png",
 #endif
 #ifdef HAVE_TIFF
@@ -429,6 +429,6 @@ TEST(Imgcodecs, write_parameter_type)
 
 }} // namespace
 
-#ifdef HAVE_OPENEXR
+#if defined(HAVE_OPENEXR) && defined(OPENCV_IMGCODECS_ENABLE_OPENEXR_TESTS)
 #include "test_exr.impl.hpp"
 #endif

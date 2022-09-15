@@ -47,6 +47,7 @@
 #include "../op_inf_engine.hpp"
 #include "../ie_ngraph.hpp"
 #include "../op_vkcom.hpp"
+#include "../op_webnn.hpp"
 
 #include <opencv2/core/utils/configuration.private.hpp>
 #include <opencv2/core/utils/logger.hpp>
@@ -70,6 +71,8 @@ using namespace cv::dnn::ocl4dnn;
 using namespace cv::dnn::cuda4dnn;
 #endif
 
+#include "fast_convolution/fast_convolution.hpp"
+
 namespace cv
 {
 namespace dnn
@@ -80,6 +83,9 @@ class BaseConvolutionLayerImpl : public ConvolutionLayer
 public:
     bool fusedWeights, fusedBias;
     std::vector<double> weightsMultipliers;
+#ifdef HAVE_WEBNN
+    int groups;
+#endif
     BaseConvolutionLayerImpl(const LayerParams &params)
     {
         setParamsFrom(params);
@@ -87,15 +93,14 @@ public:
 
         numOutput = params.get<int>("num_output");
         int ngroups = params.get<int>("group", 1);
+#ifdef HAVE_WEBNN
+        groups = ngroups;
+#endif
         CV_Assert(numOutput % ngroups == 0);
 
         if (kernel_size.size() == 2) {
             kernel = Size(kernel_size[1], kernel_size[0]);
             stride = Size(strides[1], strides[0]);
-            for (int i = 0; i < pads_begin.size(); i++) {
-                if (pads_begin[i] != pads_end[i])
-                    CV_Error(Error::StsNotImplemented, "Unsupported asymmetric padding in convolution layer");
-            }
             pad = Size(pads_begin[1], pads_begin[0]);
             dilation = Size(dilations[1], dilations[0]);
 
@@ -109,6 +114,9 @@ public:
 
         fusedWeights = false;
         fusedBias = false;
+
+        if (kernel_size.size() == 2)
+            isConv2D = true;
     }
 
     virtual void finalize(InputArrayOfArrays inputs_arr, OutputArrayOfArrays outputs_arr) CV_OVERRIDE
@@ -154,10 +162,6 @@ public:
         }
         getConvPoolPaddings(inpShape, kernel_size, strides, padMode, pads_begin, pads_end);
         if (pads_begin.size() == 2) {
-            for (int i = 0; i < pads_begin.size(); i++) {
-                if (pads_begin[i] != pads_end[i])
-                    CV_Error(Error::StsNotImplemented, "Unsupported asymmetric padding in convolution layer");
-            }
             pad = Size(pads_begin[1], pads_begin[0]);
         }
         fusedWeights = false;
@@ -179,6 +183,9 @@ public:
 
     virtual bool tryFuse(Ptr<Layer>& top) CV_OVERRIDE
     {
+        if (fusedAdd)   // If the Conv layer has fused Add layer, it cannot fuse other layers.
+            return false;
+
         Ptr<BlankLayer> blank_layer = top.dynamicCast<BlankLayer>();
         if (blank_layer)
             return true;
@@ -246,10 +253,12 @@ class ConvolutionLayerImpl CV_FINAL : public BaseConvolutionLayerImpl
 {
 public:
     enum { VEC_ALIGN = 8, DFT_TYPE = CV_32F };
-    Mat weightsMat;
+    Mat weightsMat;  // Used to store weight params. It will be used for layer fusion and memory alignment.
     std::vector<float> biasvec;
     std::vector<float> reluslope;
     Ptr<ActivationLayer> activ;
+
+    Ptr<FastConv2d> fastConv2dImpl;
 
 #ifdef HAVE_OPENCL
     Ptr<OCL4DNNConvSpatial<float> > convolutionOp;
@@ -323,7 +332,7 @@ public:
         }
 #endif
 #ifdef HAVE_INF_ENGINE
-        if (backendId == DNN_BACKEND_INFERENCE_ENGINE_NN_BUILDER_2019 || backendId == DNN_BACKEND_INFERENCE_ENGINE_NGRAPH)
+        if (backendId == DNN_BACKEND_INFERENCE_ENGINE_NGRAPH)
         {
             bool isArmTarget = preferableTarget == DNN_TARGET_CPU && isArmComputePlugin();
             if (isArmTarget && blobs.empty())
@@ -333,7 +342,7 @@ public:
             if (ksize == 3)
                 return preferableTarget != DNN_TARGET_MYRIAD && !isArmTarget;
             bool isMyriad = preferableTarget == DNN_TARGET_MYRIAD || preferableTarget == DNN_TARGET_HDDL;
-            if ((backendId == DNN_BACKEND_INFERENCE_ENGINE_NN_BUILDER_2019 || !isMyriad) && blobs.empty())
+            if (!isMyriad && blobs.empty())
                 return false;
             return (!isMyriad || dilation.width == dilation.height);
         }
@@ -347,6 +356,17 @@ public:
 #ifdef HAVE_VULKAN
         if (backendId == DNN_BACKEND_VKCOM)
             return ksize == 2;
+#endif
+#ifdef HAVE_WEBNN
+        if (backendId == DNN_BACKEND_WEBNN)
+        {
+            if (ksize != 2)
+            {
+                CV_LOG_WARNING(NULL, "WebNN only supports Conv2d.");
+                return false;
+            }
+            return true;
+        }
 #endif
         return false;
     }
@@ -403,7 +423,9 @@ public:
         if (!blobs.empty())
         {
             Mat wm = blobs[0].reshape(1, numOutput);
-            if( wm.step1() % VEC_ALIGN != 0 )
+            if ((wm.step1() % VEC_ALIGN != 0) ||
+                !isAligned<VEC_ALIGN * sizeof(float)>(wm.data)
+            )
             {
                 int newcols = (int)alignSize(wm.step1(), VEC_ALIGN);
                 Mat wm_buffer = Mat(numOutput, newcols, wm.type());
@@ -558,11 +580,15 @@ public:
             }
         }
 #endif
-        return !activ.empty();
+        fusedActivation = !activ.empty();
+        return fusedActivation;
     }
 
     virtual bool tryFuse(Ptr<Layer>& top) CV_OVERRIDE
     {
+        if (fusedAdd)   // If the Conv layer has fused Add layer, it cannot fuse other layers.
+            return false;
+
 #ifdef HAVE_CUDA
         if(IS_DNN_CUDA_TARGET(preferableTarget))
         {
@@ -629,6 +655,7 @@ public:
     virtual Ptr<BackendNode> initVkCom(const std::vector<Ptr<BackendWrapper> > &inputs) CV_OVERRIDE
     {
 #ifdef HAVE_VULKAN
+        CV_Assert(!blobs.empty());
         int out_channel = blobs[0].size[0];
         bool has_bias = hasBias() || fusedBias;
         int filter_size[2] = {kernel.height, kernel.width};
@@ -694,6 +721,7 @@ public:
     virtual Ptr<BackendNode> initHalide(const std::vector<Ptr<BackendWrapper> > &inputs) CV_OVERRIDE
     {
 #ifdef HAVE_HALIDE
+        CV_Assert(!blobs.empty());
         Halide::Buffer<float> inputBuffer = halideBuffer(inputs[0]);
 
         const int inpCn = inputBuffer.channels();
@@ -739,73 +767,12 @@ public:
         return Ptr<BackendNode>();
     }
 
-#ifdef HAVE_DNN_IE_NN_BUILDER_2019
-    virtual Ptr<BackendNode> initInfEngine(const std::vector<Ptr<BackendWrapper> > &inputs) CV_OVERRIDE
-    {
-        InferenceEngine::DataPtr input = infEngineDataNode(inputs[0]);
-        std::vector<size_t> dims = input->getDims();
-        CV_Assert(dims.size() == 4 || dims.size() == 5);
-        const int inpCn = dims[1];
-        const int outCn = blobs[0].size[0];
-        const int inpGroupCn = blobs[0].size[1];
-        const int group = inpCn / inpGroupCn;
-        InferenceEngine::Layout layout = (dims.size() == 4) ? InferenceEngine::Layout::OIHW :
-                                                              InferenceEngine::Layout::NCDHW;
-
-        auto ieWeights = wrapToInfEngineBlob(blobs[0], layout);
-        if (fusedWeights)
-        {
-            if (weightsMat.isContinuous())
-            {
-                Mat cvWeights = weightsMat.reshape(1, blobs[0].dims, blobs[0].size);
-                ieWeights = wrapToInfEngineBlob(cvWeights, layout);
-            }
-            else
-            {
-                ieWeights = InferenceEngine::make_shared_blob<float>({
-                                InferenceEngine::Precision::FP32,
-                                ieWeights->getTensorDesc().getDims(), layout
-                            });
-                ieWeights->allocate();
-
-                Mat newWeights = infEngineBlobToMat(ieWeights).reshape(1, outCn);
-                Mat cvWeights = weightsMat.colRange(0, newWeights.cols);
-                cvWeights.copyTo(newWeights);
-            }
-        }
-        InferenceEngine::Blob::Ptr ieBiases;
-        if (hasBias() || fusedBias)
-        {
-            Mat biasesMat({outCn}, CV_32F, &biasvec[0]);
-            ieBiases = wrapToInfEngineBlob(biasesMat, {(size_t)outCn}, InferenceEngine::Layout::C);
-        }
-
-        InferenceEngine::Builder::ConvolutionLayer ieLayer(name);
-
-        ieLayer.setKernel(kernel_size);
-        ieLayer.setStrides(strides);
-        ieLayer.setDilation(dilations);
-        ieLayer.setPaddingsBegin(pads_begin);
-        ieLayer.setPaddingsEnd(pads_end);
-        ieLayer.setGroup((size_t)group);
-        ieLayer.setOutDepth((size_t)outCn);
-
-        InferenceEngine::Builder::Layer l = ieLayer;
-        addConstantData("weights", ieWeights, l);
-        if (ieBiases)
-            addConstantData("biases", ieBiases, l);
-
-        if (!padMode.empty())
-            l.getParameters()["auto_pad"] = padMode == "VALID" ? std::string("valid") : std::string("same_upper");
-
-        return Ptr<BackendNode>(new InfEngineBackendNode(l));
-    }
-#endif  // HAVE_DNN_IE_NN_BUILDER_2019
 
 #ifdef HAVE_DNN_NGRAPH
     virtual Ptr<BackendNode> initNgraph(const std::vector<Ptr<BackendWrapper> > &inputs,
                                         const std::vector<Ptr<BackendNode> >& nodes) CV_OVERRIDE
     {
+        CV_Assert(!blobs.empty());
         CV_Assert_N(inputs.size() >= 1, nodes.size() >= 1);
         auto& ieInpNode = nodes[0].dynamicCast<InfEngineNgraphNode>()->node;
         std::vector<size_t> dims = ieInpNode->get_shape();
@@ -896,6 +863,109 @@ public:
     }
 #endif  // HAVE_DNN_NGRAPH
 
+#ifdef HAVE_WEBNN
+    virtual Ptr<BackendNode> initWebnn(const std::vector<Ptr<BackendWrapper> >& inputs, const std::vector<Ptr<BackendNode> >& nodes) CV_OVERRIDE
+    {
+        CV_Assert(!blobs.empty());
+        CV_Assert_N(inputs.size() >= 1, nodes.size() >= 1);
+        Ptr<WebnnBackendNode> node = nodes[0].dynamicCast<WebnnBackendNode>();
+        auto& webnnInpOperand = node->operand;
+        auto& webnnGraphBuilder = node->net->builder;
+        ml::Operand webnnWeights = nodes.size() > 1 ? nodes[1].dynamicCast<WebnnBackendNode>()->operand : nullptr;
+        if (nodes.size() > 1)
+            CV_Assert(webnnWeights);
+        const int inpCn = weightsMat.total()/(kernel_size[0]*kernel_size[1]*numOutput);
+        const int group = groups;
+        const int inpGroupCn = inpCn / group;
+        std::vector<int32_t> kernel_shape;
+        if (group != 1)
+        {
+            kernel_shape.push_back(group);
+        }
+        kernel_shape.push_back(numOutput / group);
+        kernel_shape.push_back(inpGroupCn);
+        std::copy(kernel_size.begin(), kernel_size.end(), back_inserter(kernel_shape));
+
+        if (nodes.size() == 1)
+        {
+            webnnWeights = webnn::BuildConstant(webnnGraphBuilder, webnn::getShape(blobs[0]), blobs[0].data, blobs[0].total()*blobs[0].elemSize(), ml::OperandType::Float32);
+            if (fusedWeights)
+            {
+                if (weightsMat.isContinuous())
+                {
+                    webnnWeights = webnn::BuildConstant(webnnGraphBuilder, webnn::getShape(weightsMat), weightsMat.data, weightsMat.total()*weightsMat.elemSize(), ml::OperandType::Float32);
+                }
+                else
+                {
+                    Mat newWeights;
+                    Mat cvWeights = weightsMat.colRange(0, blobs[0].total() / numOutput);
+                    cvWeights.copyTo(newWeights);
+                    webnnWeights = webnn::BuildConstant(webnnGraphBuilder, webnn::getShape(newWeights), newWeights.data, newWeights.total()*newWeights.elemSize(), ml::OperandType::Float32);
+                }
+            }
+        }
+        else
+        {
+            webnnWeights  = webnnGraphBuilder.Reshape(webnnWeights, kernel_shape.data(), kernel_shape.size());
+        }
+
+        ml::AutoPad pad_type = ml::AutoPad::Explicit;
+        if (!padMode.empty())
+            pad_type = padMode == "VALID" ? ml::AutoPad::Explicit : ml::AutoPad::SameUpper;
+
+        ml::Conv2dOptions options = {};
+        options.groups = group;
+        options.autoPad = pad_type;
+        std::vector<int32_t> Strides(strides.begin(), strides.end());
+        if (!Strides.empty())
+        {
+            options.stridesCount = Strides.size();
+            options.strides = Strides.data();
+        }
+        std::vector<int32_t> Padding;
+        if (padMode.empty())
+        {
+            Padding = {static_cast<int32_t>(pads_begin[0]),
+                       static_cast<int32_t>(pads_end[0]),
+                       static_cast<int32_t>(pads_begin[1]),
+                       static_cast<int32_t>(pads_end[1])};
+        }
+        else if (padMode == "VALID")
+        {
+            Padding = {0, 0, 0, 0};
+        }
+        if (!Padding.empty())
+        {
+            options.paddingCount = Padding.size();
+            options.padding = Padding.data();
+        }
+        std::vector<int32_t> Dilations(dilations.begin(), dilations.end());
+        if (!Dilations.empty())
+        {
+            options.dilationsCount = Dilations.size();
+            options.dilations = Dilations.data();
+        }
+        ml::Operand operand = webnnGraphBuilder.Conv2d(webnnInpOperand, webnnWeights, &options);
+
+        // ml::Operand result = operand;
+        if (hasBias() || fusedBias || nodes.size() == 3)
+        {
+            ml::Operand webnnBias = nullptr;
+            if (nodes.size() == 3)
+            {
+                std::vector<int32_t> bias_shape = {1, numOutput, 1, 1};
+                webnnBias = webnnGraphBuilder.Reshape(nodes[2].dynamicCast<WebnnBackendNode>()->operand, bias_shape.data(), bias_shape.size());
+            }
+            else
+            {
+                webnnBias = webnn::BuildConstant(webnnGraphBuilder, {1, numOutput, 1, 1}, biasvec.data(), (numOutput) * sizeof(float), ml::OperandType::Float32);
+            }
+            operand = webnnGraphBuilder.Add(operand, webnnBias);
+        }
+        return Ptr<BackendNode>(new WebnnBackendNode(operand));
+    }
+#endif // HAVE_WEBNN
+
     class ParallelConv : public cv::ParallelLoopBody
     {
     public:
@@ -916,12 +986,13 @@ public:
         bool useAVX2;
         bool useAVX512;
         bool useRVV;
+        bool useLASX;
         int blk_size_cn;
 
         ParallelConv()
             : input_(0), weights_(0), output_(0), ngroups_(0), nstripes_(0),
               biasvec_(0), reluslope_(0), activ_(0), is1x1_(false), useAVX(false), useAVX2(false), useAVX512(false), useRVV(false)
-            , blk_size_cn(0)
+            , useLASX(false), blk_size_cn(0)
         {}
 
         static void run( const Mat& input, Mat& output, const Mat& weights,
@@ -979,6 +1050,7 @@ public:
             p.useAVX2   = checkHardwareSupport(CPU_AVX2) && isConv2D;
             p.useAVX512 = CV_CPU_HAS_SUPPORT_AVX512_SKX  && isConv2D;
             p.useRVV   = checkHardwareSupport(CPU_RVV) && isConv2D;
+            p.useLASX  = checkHardwareSupport(CPU_LASX) && isConv2D;
 
             int kernel_d = isConv3D? kernel_size[0] : 1;
             int kernel_h = isConv1D? 1 : kernel_size[kernel_size.size() - 2];
@@ -1183,6 +1255,13 @@ public:
                         #if CV_TRY_RVV
                             if(useRVV)
                                 opt_RVV::fastDepthwiseConv(wptr, kernel_h, kernel_w,
+                                    stride_h, stride_w, dilation_h, dilation_w, pad_t, pad_l,
+                                    biasptr, relu, inptr_, height, width, outptr_, out_d, outH, outW);
+                            else
+                        #endif
+                        #if CV_TRY_LASX
+                            if(useLASX)
+                                opt_LASX::fastDepthwiseConv(wptr, kernel_h, kernel_w,
                                     stride_h, stride_w, dilation_h, dilation_w, pad_t, pad_l,
                                     biasptr, relu, inptr_, height, width, outptr_, out_d, outH, outW);
                             else
@@ -1535,7 +1614,6 @@ public:
                                 }
                             }
                         }
-
                         // now compute dot product of the weights
                         // and im2row-transformed part of the tensor
                     #if CV_TRY_AVX512_SKX
@@ -1561,6 +1639,12 @@ public:
                         if(useRVV)
                             opt_RVV::fastConv(wptr, wstep, biasptr, rowbuf0, data_out0 + ofs0,
                                          outShape, bsz, vsz, vsz_a, relu, cn0 == 0);
+                        else
+                    #endif
+                    #if CV_TRY_LASX
+                        if(useLASX)
+                            opt_LASX::fastConv(wptr, wstep, biasptr, rowbuf0, data_out0 + ofs0,
+                                          outShape, bsz, vsz, vsz_a, relu, cn0 == 0);
                         else
                     #endif
                         for( int i = 0; i < outCn; i += 2 )
@@ -1734,7 +1818,10 @@ public:
             config.in_shape = shape(inputs[0]);
             config.out_shape = shape(outputs[0]);
             config.kernel = kernel;
-            config.pad = pad;
+            // pads_begin: 0 - pad_top, 1 - pad_left
+            // pads_end: 0 - pad_bottom, 1 - pad_right
+            std::vector<int> pads = {int(pads_begin[0]), int(pads_end[0]), int(pads_begin[1]), int(pads_end[1])};
+            config.pads = pads;
             config.stride = stride;
             config.dilation = dilation;
             if (inputs[0].dims != 4 && inputs[0].dims != umat_blobs[0].dims)
@@ -1870,13 +1957,6 @@ public:
         CV_TRACE_FUNCTION();
         CV_TRACE_ARG_VALUE(name, "name", name.c_str());
 
-#if CV_SSE3
-        uint32_t ftzMode = _MM_GET_FLUSH_ZERO_MODE();
-        uint32_t dazMode = _MM_GET_DENORMALS_ZERO_MODE();
-        _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
-        _MM_SET_DENORMALS_ZERO_MODE(_MM_DENORMALS_ZERO_ON);
-#endif
-
         CV_OCL_RUN(IS_DNN_OPENCL_TARGET(preferableTarget),
                    forward_ocl(inputs_arr, outputs_arr, internals_arr))
 
@@ -1892,8 +1972,10 @@ public:
 
         int outCn = blobs.empty() ? inputs[1].size[0] : blobs[0].size[0];
         // Need to align non-const blobs
+        bool variableWeight = false;
         if (blobs.empty())
         {
+            variableWeight = true;
             Mat wm = inputs[1].reshape(1, outCn);
             if (wm.data != weightsMat.data)
             {
@@ -1953,7 +2035,7 @@ public:
         }
 
 #ifdef HAVE_TENGINE
-        bool tengine_ret = false; ;
+        bool tengine_ret = false;
 
         std::vector<Mat> teng_in, teng_out;
         inputs_arr.getMatVector(teng_in);
@@ -1978,20 +2060,24 @@ public:
         /* tengine_init will run when first time. */
         if(NULL == tengine_graph)
         {
+            // pads_begin: 0 - pad_top,    1 - pad_left
+            // pads_end:   0 - pad_bottom, 1 - pad_right
+            // pad_h0: pad_top,  pad_h1: pad_bottom
+            // pad_w0: pad_left, pad_w1: pad_right
             tengine_graph = tengine_init(name.c_str(), input_, inch, ngroups, in_h, in_w,
                                          output_, out_b, outch, out_h, out_w,
                                          kernel_, kernel_size.size(), kernel.height, kernel.width,
                                          teg_bias, stride.height, stride.width,
-                                         pad.height,  pad.width, dilation.height, dilation.width,
+                                         pads_begin[0], pads_end[0], pads_begin[1], pads_end[1], dilation.height, dilation.width,
                                          weightsMat.step1(), padMode, tengine_graph, nstripes);
-            /*printf("Init(%s):  input=%p(%d %d %d %d ),output=%p(%d %d %d %d ),kernel=%p(%ld %d %d ), bias=%p ,"
-                   "stride(%d %d), pad(%d %d), dilation(%d %d) ,weightsMat=%ld, padMode=%s ,tengine_graph = %p \n",
-                   name.c_str(),input_, inch, ngroups, in_h, in_w,
-                   output_, out_b, outch, out_h, out_w,
-                   kernel_, kernel_size.size(), kernel.height, kernel.width,
-                   teg_bias, stride.height, stride.width,
-                   pad.height,  pad.width, dilation.height, dilation.width,
-                   weightsMat.step1(), padMode.c_str() ,tengine_graph);*/
+            // printf("Init(%s):  input=%p(%d %d %d %d ),output=%p(%d %d %d %d ),kernel=%p(%ld %d %d ), bias=%p ,"
+            //        "stride(%d %d), pad(%d %d %d %d), dilation(%d %d) ,weightsMat=%ld, padMode=%s ,tengine_graph = %p \n",
+            //        name.c_str(),input_, inch, ngroups, in_h, in_w,
+            //        output_, out_b, outch, out_h, out_w,
+            //        kernel_, kernel_size.size(), kernel.height, kernel.width,
+            //        teg_bias, stride.height, stride.width,
+            //        pads_begin[0], pads_end[0], pads_begin[1], pads_end[1], dilation.height, dilation.width,
+            //        weightsMat.step1(), padMode.c_str() ,tengine_graph);
         }
         if(NULL != tengine_graph)
         {
@@ -2010,13 +2096,37 @@ public:
         {
             int nstripes = std::max(getNumThreads(), 1);
 
+            // Initialization of FastCovn2d, pack weight.
+            if ((!fastConv2dImpl || variableWeight) && inputs[0].dims == 4)
+            {
+                int K = outputs[0].size[1];
+                int C = inputs[0].size[1];
+                int Hk = kernel_size[kernel_size.size() - 2];
+                int Wk = kernel_size.back();
+
+                CV_Assert(outputs[0].size[1] % ngroups == 0);
+                int stride_h = strides[strides.size() - 2];
+                int stride_w = strides.back();
+
+                int dilation_h = dilations[dilations.size() - 2];
+                int dilation_w = dilations.back();
+
+                fastConv2dImpl = initFastConv2d(ngroups, K, C, Hk, Wk, stride_w, stride_h, dilation_w,
+                                                dilation_h, pads_begin, pads_end, weightsMat, &biasvec[0]);
+            }
+
+            if (fastConv2dImpl)
+            {
+                runFastConv2d(inputs[0], outputs[0], fastConv2dImpl, nstripes, activ, fusedAdd);
+                return;
+            }
+
+            //TODO: Add support of Conv1D and Conv3D to fastConv, and remove the old Conv branch.
+            // Use only for Conv1D and Conv3D.
+            CV_Assert(!fusedAdd);
             ParallelConv::run(inputs[0], outputs[0], weightsMat, biasvec, reluslope,
                             kernel_size, strides, pads_begin, pads_end, dilations, activ.get(), ngroups, nstripes);
         }
-#if CV_SSE3
-        _MM_SET_FLUSH_ZERO_MODE(ftzMode);
-        _MM_SET_DENORMALS_ZERO_MODE(dazMode);
-#endif
     }
 
 #ifdef HAVE_CUDA
@@ -2028,6 +2138,7 @@ public:
     {
         auto context = reinterpret_cast<csl::CSLContext*>(context_);
 
+        // TODO: extract bias from inputs and pass it
         CV_Assert(inputs.size() == 1 || inputs.size() == 2);
         auto input_wrapper = inputs[0].dynamicCast<CUDABackendWrapper>();
         auto input_shape = input_wrapper->getShape();
@@ -2036,6 +2147,7 @@ public:
         auto output_wrapper = outputs[0].dynamicCast<CUDABackendWrapper>();
         auto output_shape = output_wrapper->getShape();
 
+        CV_Assert(!blobs.empty());
         const auto output_feature_maps = blobs[0].size[0];
         const auto input_feature_maps = input_shape[1];
         const auto input_feature_maps_per_group = blobs[0].size[1];
@@ -2115,30 +2227,41 @@ public:
         float inputScale = scales[0][0], outputScale = scales[1][0];
         int inputZp = zeropoints[0][0];
         params.set("input_zeropoint", inputZp);
+        params.set("input_scale", inputScale);
 
         Mat weightsQuantized(weightsMat.rows, weightsMat.cols, CV_8S);
         Mat biasQuantized(1, numOutput, CV_32S);
         Mat outputMultiplier(1, numOutput, CV_32F);
-        double realMin, realMax, weightsScale;
+        bool perChannel = params.get<bool>("per_channel", true);
 
-        for( int i = 0; i < numOutput; i++ )
+        if (perChannel) // per-Channel quantization.
         {
-            // Quantize weights
-            cv::minMaxIdx(weightsMat.row(i), &realMin, &realMax);
-            realMin = std::min(realMin, 0.0);
-            realMax = std::max(realMax, 0.0);
-            weightsScale = (realMax == realMin) ? 1.0 : std::max(-realMin, realMax)/127;
-            weightsMat.row(i).convertTo(weightsQuantized.row(i), CV_8S, 1.f/weightsScale);
+            for (int i = 0; i < numOutput; i++)
+            {
+                double weightsScale = getWeightScale(weightsMat.row(i));
 
-            // Quantize biases
+                weightsMat.row(i).convertTo(weightsQuantized.row(i), CV_8S, 1.f/weightsScale);
+                float biasScale = inputScale * weightsScale;
+                biasQuantized.at<int>(i) = cvRound(biasvec[i]/biasScale) - inputZp*(cv::sum(weightsQuantized.row(i))[0]);
+                outputMultiplier.at<float>(i) = biasScale / outputScale;
+            }
+        }
+        else // per-Tensor quantization.
+        {
+            double weightsScale = getWeightScale(weightsMat);
+
+            weightsMat.convertTo(weightsQuantized, CV_8S, 1.f/weightsScale);
             float biasScale = inputScale * weightsScale;
-            biasQuantized.at<int>(i) = (int)std::round(biasvec[i]/biasScale) - inputZp*(cv::sum(weightsQuantized.row(i))[0]);
 
-            // Store multiplier
-            outputMultiplier.at<float>(i) = biasScale / outputScale;
+            for (int i = 0; i < numOutput; i++)
+            {
+                biasQuantized.at<int>(i) = cvRound(biasvec[i]/biasScale) - inputZp*(cv::sum(weightsQuantized.row(i))[0]);
+                outputMultiplier.at<float>(i) = biasScale / outputScale;
+            }
         }
 
         params.blobs.clear();
+        params.set("per_channel", perChannel);
         params.blobs.push_back(weightsQuantized.reshape(1, shape(blobs[0])));
         params.blobs.push_back(biasQuantized);
         params.blobs.push_back(outputMultiplier);
@@ -2203,52 +2326,6 @@ public:
         if (backendId == DNN_BACKEND_INFERENCE_ENGINE_NGRAPH) {
             return group == 1;
         }
-
-#ifdef HAVE_DNN_IE_NN_BUILDER_2019
-        if (backendId == DNN_BACKEND_INFERENCE_ENGINE_NN_BUILDER_2019)
-        {
-            if (kernel_size.size() == 3 && preferableTarget != DNN_TARGET_CPU) {
-                return false;
-            }
-
-            if (std::accumulate(adjust_pads.begin(), adjust_pads.end(), 0, std::plus<size_t>()) > 0)
-            {
-                if (padMode.empty())
-                {
-                    if (preferableTarget != DNN_TARGET_CPU && group != 1)
-                    {
-                        for (int i = 0; i < adjust_pads.size(); i++) {
-                            if (adjust_pads[i] && pads_begin[i])
-                                return false;
-                        }
-                    }
-                    for (int i = 0; i < adjust_pads.size(); i++) {
-                        if (pads_end[i] < adjust_pads[i])
-                            return false;
-                    }
-                    return true;
-                }
-                else if (padMode == "SAME")
-                {
-                    for (int i = 0; i < adjust_pads.size(); i++) {
-                        if (kernel_size[i] < pads_begin[i] + 1 + adjust_pads[i])
-                            return false;
-                    }
-                    return true;
-                }
-                else if (padMode == "VALID")
-                    return false;
-            }
-
-            if (group != 1)
-            {
-                return preferableTarget == DNN_TARGET_CPU;
-            }
-            if (preferableTarget == DNN_TARGET_OPENCL || preferableTarget == DNN_TARGET_OPENCL_FP16)
-                return std::accumulate(dilations.begin(), dilations.end(), 1, std::multiplies<size_t>()) == 1;
-            return true;
-        }
-#endif  // HAVE_DNN_IE_NN_BUILDER_2019
 #endif  // HAVE_INF_ENGINE
         {
             return backendId == DNN_BACKEND_CUDA ||
@@ -2375,6 +2452,7 @@ public:
             useAVX2 = checkHardwareSupport(CPU_AVX2);
             useAVX512 = CV_CPU_HAS_SUPPORT_AVX512_SKX;
             useRVV = checkHardwareSupport(CPU_RVV);
+            useLASX = checkHardwareSupport(CPU_LASX);
         }
 
         void operator()(const Range& range_) const CV_OVERRIDE
@@ -2411,6 +2489,11 @@ public:
             if( useRVV ) {
                 opt_RVV::fastGEMM( aptr, astep, bptr, bstep, cptr, cstep, mmax, kmax, nmax );
             }
+            else
+        #endif
+        #if CV_TRY_LASX
+            if( useLASX )
+                opt_LASX::fastGEMM( aptr, astep, bptr, bstep, cptr, cstep, mmax, kmax, nmax );
             else
         #endif
             for( m = 0; m < mmax; m += 2 )
@@ -2512,6 +2595,7 @@ public:
         bool useAVX2;
         bool useAVX512;
         bool useRVV;
+        bool useLASX;
     };
 
     class Col2ImInvoker : public cv::ParallelLoopBody
@@ -2797,6 +2881,7 @@ public:
         const std::vector<Ptr<BackendWrapper>>& outputs
     ) override
     {
+        CV_Assert(!blobs.empty());
         auto context = reinterpret_cast<csl::CSLContext*>(context_);
 
         CV_Assert(inputs.size() == 1);
@@ -2854,6 +2939,7 @@ public:
     virtual Ptr<BackendNode> initHalide(const std::vector<Ptr<BackendWrapper> > &inputs) CV_OVERRIDE
     {
 #ifdef HAVE_HALIDE
+        CV_Assert(!blobs.empty());
         Halide::Buffer<float> inputBuffer = halideBuffer(inputs[0]);
 
         int inW, inH, inC, inN;
@@ -2904,68 +2990,12 @@ public:
         return Ptr<BackendNode>();
     }
 
-#ifdef HAVE_DNN_IE_NN_BUILDER_2019
-    virtual Ptr<BackendNode> initInfEngine(const std::vector<Ptr<BackendWrapper> > &) CV_OVERRIDE
-    {
-        InferenceEngine::Layout layout = blobs[0].dims == 5? InferenceEngine::Layout::NCDHW :
-                                                             InferenceEngine::Layout::OIHW;
-
-        auto ieWeights = wrapToInfEngineBlob(blobs[0], layout);
-        if (fusedWeights)
-        {
-            ieWeights = InferenceEngine::make_shared_blob<float>({
-                            InferenceEngine::Precision::FP32,
-                            ieWeights->getTensorDesc().getDims(), layout
-                        });
-            ieWeights->allocate();
-
-            int inpCn = blobs[0].size[0];
-            Mat newWeights = infEngineBlobToMat(ieWeights).reshape(1, inpCn);
-            transpose(weightsMat, newWeights);
-        }
-
-        const int outGroupCn = blobs[0].size[1];  // Weights are in IOHW or OIDHW layout
-        const int group = numOutput / outGroupCn;
-
-        InferenceEngine::Builder::DeconvolutionLayer ieLayer(name);
-
-        ieLayer.setKernel(kernel_size);
-        ieLayer.setStrides(strides);
-        ieLayer.setDilation(dilations);
-        ieLayer.setPaddingsBegin(pads_begin);
-
-        if (padMode.empty())
-        {
-            std::vector<size_t> paddings_end;
-            for (int i = 0; i < pads_end.size(); i++) {
-                paddings_end.push_back(pads_end[i] - adjust_pads[i]);
-            }
-            ieLayer.setPaddingsEnd(paddings_end);
-        }
-        else if (padMode == "SAME")
-        {
-            std::vector<size_t> paddings_end;
-            for (int i = 0; i < pads_begin.size(); i++) {
-                paddings_end.push_back(kernel_size[i] - pads_begin[i] - 1 - adjust_pads[i]);
-            }
-            ieLayer.setPaddingsEnd(paddings_end);
-        }
-        ieLayer.setGroup((size_t)group);
-        ieLayer.setOutDepth((size_t)numOutput);
-
-        InferenceEngine::Builder::Layer l = ieLayer;
-        addConstantData("weights", ieWeights, l);
-        if (hasBias())
-            addConstantData("biases", wrapToInfEngineBlob(biasesMat, {(size_t)numOutput}, InferenceEngine::Layout::C), l);
-        return Ptr<BackendNode>(new InfEngineBackendNode(l));
-    }
-#endif  // HAVE_DNN_IE_NN_BUILDER_2019
-
 
 #ifdef HAVE_DNN_NGRAPH
     virtual Ptr<BackendNode> initNgraph(const std::vector<Ptr<BackendWrapper> > &inputs,
                                         const std::vector<Ptr<BackendNode> >& nodes) CV_OVERRIDE
     {
+       CV_Assert(!blobs.empty());
        const int outGroupCn = blobs[0].size[1];
        const int group = numOutput / outGroupCn;
        CV_Assert(group == 1);

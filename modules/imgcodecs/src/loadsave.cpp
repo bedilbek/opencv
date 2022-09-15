@@ -167,7 +167,10 @@ struct ImageCodecInitializer
         decoders.push_back( makePtr<TiffDecoder>() );
         encoders.push_back( makePtr<TiffEncoder>() );
     #endif
-    #ifdef HAVE_PNG
+    #ifdef HAVE_SPNG
+        decoders.push_back( makePtr<SPngDecoder>() );
+        encoders.push_back( makePtr<SPngEncoder>() );
+    #elif defined(HAVE_PNG)
         decoders.push_back( makePtr<PngDecoder>() );
         encoders.push_back( makePtr<PngEncoder>() );
     #endif
@@ -235,8 +238,10 @@ static ImageDecoder findDecoder( const String& filename ) {
     FILE* f= fopen( filename.c_str(), "rb" );
 
     /// in the event of a failure, return an empty image decoder
-    if( !f )
+    if( !f ) {
+        CV_LOG_WARNING(NULL, "imread_('" << filename << "'): can't open/read file: check file path/integrity");
         return ImageDecoder();
+    }
 
     // read the file signature
     String signature(maxlen, ' ');
@@ -560,7 +565,7 @@ imreadmulti_(const String& filename, int flags, std::vector<Mat>& mats, int star
             if ((flags & IMREAD_ANYDEPTH) == 0)
                 type = CV_MAKETYPE(CV_8U, CV_MAT_CN(type));
 
-            if ((flags & CV_LOAD_IMAGE_COLOR) != 0 ||
+            if ((flags & IMREAD_COLOR) != 0 ||
                 ((flags & IMREAD_ANYCOLOR) != 0 && CV_MAT_CN(type) > 1))
                 type = CV_MAKETYPE(CV_MAT_DEPTH(type), 3);
             else
