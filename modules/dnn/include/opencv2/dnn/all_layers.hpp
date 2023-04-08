@@ -259,6 +259,7 @@ CV__DNN_INLINE_NS_BEGIN
         bool fusedActivation = false;
         bool fusedAdd = false;
         bool isConv2D = false; // Should be deleted after fastconv branch support Conv1D and Conv3D.
+        bool useWinograd = false; // Flag whether to use Winograd to speed up 3x3 convolution.
     };
 
     class CV_EXPORTS ConvolutionLayerInt8 : public BaseConvolutionLayer
@@ -270,6 +271,7 @@ CV__DNN_INLINE_NS_BEGIN
         // quantization type flag. The perChannel default is true, that means it contains the parameters
         // of per-Channel quantization. Otherwise, that means this layer contains per-Tensor quantized parameters.
         bool per_channel;
+        bool useWinograd = true; // Flag whether to use Winograd to speed up 3x3 convolution.
         static Ptr<BaseConvolutionLayer> create(const LayerParams& params);
     };
 
@@ -299,6 +301,14 @@ CV__DNN_INLINE_NS_BEGIN
     {
     public:
         static Ptr<ArgLayer> create(const LayerParams& params);
+    };
+
+    /** @brief Gather layer
+     */
+    class CV_EXPORTS GatherLayer : public Layer
+    {
+    public:
+        static Ptr<GatherLayer> create(const LayerParams& params);
     };
 
     class CV_EXPORTS PoolingLayer : public Layer
@@ -364,6 +374,10 @@ CV__DNN_INLINE_NS_BEGIN
         static Ptr<SoftmaxLayerInt8> create(const LayerParams& params);
     };
 
+    /**
+     * `InnerProduct`, `MatMul` and `Gemm` operations are all implemented by Fully Connected Layer.
+     * Parameter `is_matmul` is used to distinguish `MatMul` and `Gemm` from `InnerProduct`.
+     */
     class CV_EXPORTS InnerProductLayer : public Layer
     {
     public:
@@ -412,16 +426,16 @@ CV__DNN_INLINE_NS_BEGIN
     class CV_EXPORTS QuantizeLayer : public Layer
     {
     public:
-        float scale;
-        int zeropoint;
+        std::vector<float> scales;
+        std::vector<int> zeropoints;
         static Ptr<QuantizeLayer> create(const LayerParams &params);
     };
 
     class CV_EXPORTS DequantizeLayer : public Layer
     {
     public:
-        float scale;
-        int zeropoint;
+        std::vector<float> scales;
+        std::vector<int> zeropoints;
         static Ptr<DequantizeLayer> create(const LayerParams &params);
     };
 
@@ -792,6 +806,18 @@ CV__DNN_INLINE_NS_BEGIN
         static Ptr<SeluLayer> create(const LayerParams &params);
     };
 
+    class CV_EXPORTS GeluLayer : public ActivationLayer
+    {
+    public:
+        static Ptr<GeluLayer> create(const LayerParams &params);
+    };
+
+    class CV_EXPORTS GeluApproximationLayer : public ActivationLayer
+    {
+    public:
+        static Ptr<GeluApproximationLayer> create(const LayerParams &params);
+    };
+
     class CV_EXPORTS ThresholdedReluLayer : public ActivationLayer
     {
     public:
@@ -1055,6 +1081,34 @@ CV__DNN_INLINE_NS_BEGIN
         int reverse;
 
         static Ptr<CumSumLayer> create(const LayerParams& params);
+    };
+
+    class CV_EXPORTS ScatterLayer : public Layer
+    {
+    public:
+        static Ptr<ScatterLayer> create(const LayerParams& params);
+    };
+
+    class CV_EXPORTS ScatterNDLayer : public Layer
+    {
+    public:
+        static Ptr<ScatterNDLayer> create(const LayerParams& params);
+    };
+
+    class CV_EXPORTS TileLayer : public Layer
+    {
+    public:
+        static Ptr<TileLayer> create(const LayerParams& params);
+    };
+
+    class CV_EXPORTS LayerNormLayer : public Layer
+    {
+    public:
+        bool hasBias;
+        int axis;
+        float epsilon;
+
+        static Ptr<LayerNormLayer> create(const LayerParams& params);
     };
 
 //! @}

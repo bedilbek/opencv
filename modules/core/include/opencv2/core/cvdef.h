@@ -459,6 +459,7 @@ Cv64suf;
 #define CV_EXPORTS_W_SIMPLE CV_EXPORTS
 #define CV_EXPORTS_AS(synonym) CV_EXPORTS
 #define CV_EXPORTS_W_MAP CV_EXPORTS
+#define CV_EXPORTS_W_PARAMS CV_EXPORTS
 #define CV_IN_OUT
 #define CV_OUT
 #define CV_PROP
@@ -810,7 +811,7 @@ __CV_ENUM_FLAGS_BITWISE_XOR_EQ   (EnumType, EnumType)                           
 #  define CV_CONSTEXPR
 #endif
 
-// Integer types portatibility
+// Integer types portability
 #ifdef OPENCV_STDINT_HEADER
 #include OPENCV_STDINT_HEADER
 #elif defined(__cplusplus)
